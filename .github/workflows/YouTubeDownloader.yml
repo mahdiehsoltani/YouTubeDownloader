@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main                     # always work from main branch
+          ref: main
 
       - name: 🔧 Install Dependencies (with retry)
         run: |
@@ -291,7 +291,7 @@ jobs:
           OUTPUT_TYPE=$(sed -n '3p' /tmp/metadata.txt)
           STATUS_URL=$(sed -n '5p' /tmp/metadata.txt)
 
-          TEMP_DIR="./temp-download"
+          TEMP_DIR="./downloads/temp"
           mkdir -p "$TEMP_DIR"
 
           echo "⬇️ Downloading $OUTPUT_TYPE ..."
@@ -360,15 +360,23 @@ jobs:
             echo "📋 Content-Type: $CONTENT_TYPE"
           fi
 
-          mkdir -p ./downloads/temp
-          mv "$TEMP_DIR/$FILENAME" "./downloads/temp/"
-          echo "✅ File staged for processing"
+          # Move file to staging for further processing (split or direct commit)
+          # It will stay in ./downloads/temp/ for now
+
+      - name: 📦 Prepare Artifact Staging (whole file)
+        run: |
+          set -euo pipefail
+          mkdir -p ./artifact-staging
+          if [[ -d ./downloads/temp ]]; then
+            cp -a ./downloads/temp/* ./artifact-staging/ 2>/dev/null || true
+            echo "✅ Whole file(s) copied to artifact staging"
+          fi
 
       - name: ✂️ Smart Split & Safety Limit
         run: |
           set -euo pipefail
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
-          HARD_LIMIT_MB=90   # GitHub push safety limit
+          HARD_LIMIT_MB=90
 
           if [[ "$THRESHOLD_MB" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             THRESHOLD_MB=$(printf "%.0f" "$THRESHOLD_MB")
@@ -387,7 +395,6 @@ jobs:
             local size_mb=$((size / 1048576))
 
             local split_size="${THRESHOLD_MB}"
-            # force split if file exceeds hard limit, even if user set to 0 or >90
             if [[ $split_size -eq 0 || $split_size -gt $HARD_LIMIT_MB ]]; then
               if [[ $size -gt $((HARD_LIMIT_MB * 1048576)) ]]; then
                 echo "🛡️ File ${basename} (${size_mb}MB) exceeds hard push limit → force-splitting at ${HARD_LIMIT_MB}MB"
@@ -474,15 +481,15 @@ jobs:
           echo "❌ Push failed after 3 attempts"
           exit 1
 
-      - name: 📦 Upload Artifact (easy download)
+      - name: 📦 Upload Whole File as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: youtube-download-${{ github.run_id }}
-          path: ./downloads/*
+          path: ./artifact-staging/*
           retention-days: 90
 
       - name: 📋 Summary
         run: |
-          echo "📁 Files committed to branch 'downloads'"
-          echo "🌐 Permanent zip: https://github.com/${{ github.repository }}/archive/refs/heads/downloads.zip"
-          echo "📦 Artifact available in this run's 'Artifacts' section (expires in 90 days)"
+          echo "📁 Split files (if any) committed to branch 'downloads'"
+          echo "🌐 Permanent zip of that branch: https://github.com/${{ github.repository }}/archive/refs/heads/downloads.zip"
+          echo "📦 Whole file available as artifact in this run's 'Artifacts' section (expires in 90 days)"
