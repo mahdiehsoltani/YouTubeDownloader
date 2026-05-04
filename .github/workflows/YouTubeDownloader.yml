@@ -21,30 +21,36 @@ on:
         type: string
         default: '720p'
       split_threshold_mb:
-        description: '📦 Split files larger than (MB) — 0 = never (default 1800 MB, near release limit)'
+        description: '📦 Split files larger than (MB) — 0 = never'
         required: false
         type: number
-        default: 1800
+        default: 90
 
 jobs:
-  download-and-release:
-    name: 🚀 Download & Publish Release
+  download-and-deliver:
+    name: 🚀 Download & Deliver
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
 
     steps:
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main                     # always work from main branch
+
       - name: 🔧 Install Dependencies (with retry)
         run: |
           set -euo pipefail
           for i in 1 2 3; do
             echo "🔄 apt-get attempt $i..."
-            sudo apt-get update && sudo apt-get install -y zip curl jq ffmpeg gh && break || sleep 10
+            sudo apt-get update && sudo apt-get install -y zip curl jq ffmpeg && break || sleep 10
           done
           pip install requests
 
-      - name: 🎯 Request Conversion & Generate Release Info
+      - name: 🎯 Request Conversion & Generate Metadata
         id: converter
         run: |
           set -euo pipefail
@@ -65,7 +71,6 @@ jobs:
           VIDEO_QUALITIES = ['144p', '360p', '480p', '720p', '1080p']
           AUDIO_BITRATES = ['64kbps', '128kbps', '192kbps', '320kbps']
 
-          # ------ helpers ------
           def safe_json(resp):
               try:
                   return resp.json()
@@ -89,7 +94,6 @@ jobs:
                   raise last_exc
               return resp
 
-          # ------ quality normalization (4k mapping fix) ------
           def normalize_quality(output_type, quality_input):
               try:
                   quality = quality_input.lower().strip()
@@ -122,7 +126,6 @@ jobs:
               except Exception:
                   return '720p' if output_type == 'video' else '192kbps'
 
-          # validate type
           if OUTPUT_TYPE not in ('video', 'audio'):
               print(f"⚠️ Unknown type '{OUTPUT_TYPE}', forcing to video")
               OUTPUT_TYPE = 'video'
@@ -194,7 +197,7 @@ jobs:
           print(f"✅ Registered: {title}")
           print("="*50)
 
-          # ------ adaptive polling with while loop ------
+          # Adaptive polling with while loop
           download_url = None
           last_progress = -1
           stall_count = 0
@@ -246,26 +249,21 @@ jobs:
               print("⏰ Conversion did not complete in time")
               sys.exit(1)
 
-          # ------ identifiers ------
+          # Generate identifiers
           video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
           video_id = video_id_match.group(1) if video_id_match else "unknown"
           safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))[:60].strip('_') or video_id
           timestamp = time.strftime("%Y%m%d-%H%M%S")
           ext = "mp3" if OUTPUT_TYPE == 'audio' else "mp4"
-          filename = f"{safe_title}_{video_id}_{QUALITY}_{timestamp}.{ext}"
-
-          tag = f"download-{video_id}-{timestamp}-{RUN_ID}"
-          release_name = f"{title} ({QUALITY})"
-          release_notes = f"**URL:** {YT_URL}\n**Type:** {OUTPUT_TYPE}\n**Quality:** {QUALITY}\n**Downloaded:** {timestamp}"
+          quality_label = QUALITY
+          filename = f"{safe_title}_{video_id}_{quality_label}_{timestamp}.{ext}"
 
           with open('/tmp/metadata.txt', 'w', encoding='utf-8') as f:
               f.write(f"{download_url}\n{filename}\n{OUTPUT_TYPE}\n{QUALITY}\n{status_url}\n")
-          with open('/tmp/release_info.txt', 'w', encoding='utf-8') as f:
-              f.write(f"tag={tag}\nname={release_name}\nnotes={release_notes}\n")
 
           print(f"📥 Download URL: {download_url[:80]}...")
           print(f"📄 Filename: {filename}")
-          print(f"🏷️  Release tag: {tag}")
+          print(f"🏷️  Run ID: {RUN_ID}")
           PYEOF
         env:
           YT_URL: ${{ github.event.inputs.url }}
@@ -296,7 +294,7 @@ jobs:
           TEMP_DIR="./temp-download"
           mkdir -p "$TEMP_DIR"
 
-          echo "⬇️ Downloading $OUTPUT_TYPE..."
+          echo "⬇️ Downloading $OUTPUT_TYPE ..."
           echo "📄 File: $FILENAME"
 
           EXPECTED_SIZE=$(curl -sI -L "$DOWNLOAD_URL" | grep -i content-length | awk 'END{print $2}' | tr -d '\r')
@@ -362,78 +360,129 @@ jobs:
             echo "📋 Content-Type: $CONTENT_TYPE"
           fi
 
-          mkdir -p ./release-assets
-          mv "$TEMP_DIR/$FILENAME" "./release-assets/"
-          echo "✅ File staged for release: $FILENAME"
+          mkdir -p ./downloads/temp
+          mv "$TEMP_DIR/$FILENAME" "./downloads/temp/"
+          echo "✅ File staged for processing"
 
-      - name: ✂️ Optional Split (convenience)
-        if: ${{ github.event.inputs.split_threshold_mb > 0 }}
+      - name: ✂️ Smart Split & Safety Limit
         run: |
           set -euo pipefail
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
+          HARD_LIMIT_MB=90   # GitHub push safety limit
+
           if [[ "$THRESHOLD_MB" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             THRESHOLD_MB=$(printf "%.0f" "$THRESHOLD_MB")
           else
             echo "❌ Invalid split threshold: $THRESHOLD_MB"
             exit 1
           fi
-          if [[ $THRESHOLD_MB -le 0 ]]; then
-            echo "ℹ️ Split disabled (threshold=0)"
+
+          echo "📐 Split threshold (user): ${THRESHOLD_MB} MB"
+          echo "🛡️ Hard push limit: ${HARD_LIMIT_MB} MB"
+
+          process_file() {
+            local file="$1"
+            local size=$(stat -c%s "$file")
+            local basename=$(basename "$file")
+            local size_mb=$((size / 1048576))
+
+            local split_size="${THRESHOLD_MB}"
+            # force split if file exceeds hard limit, even if user set to 0 or >90
+            if [[ $split_size -eq 0 || $split_size -gt $HARD_LIMIT_MB ]]; then
+              if [[ $size -gt $((HARD_LIMIT_MB * 1048576)) ]]; then
+                echo "🛡️ File ${basename} (${size_mb}MB) exceeds hard push limit → force-splitting at ${HARD_LIMIT_MB}MB"
+                split_size="$HARD_LIMIT_MB"
+              else
+                echo "📁 $basename (${size_mb}MB) — no split required"
+                mv "$file" "./downloads/"
+                return
+              fi
+            fi
+
+            if [[ $split_size -gt 0 && $size -gt $((split_size * 1048576)) ]]; then
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "✂️ Splitting $basename (${size_mb}MB) into ${split_size}MB parts"
+              cd ./downloads
+              zip -r -s "${split_size}m" "${basename}.zip" "temp/${basename}" || {
+                echo "❌ Zip failed"
+                exit 1
+              }
+              cd ..
+              shopt -s nullglob
+              parts=( "./downloads/${basename}".z* "./downloads/${basename}.zip" )
+              if [[ ${#parts[@]} -eq 0 ]]; then
+                echo "❌ No split parts found!"
+                exit 1
+              fi
+              echo "✅ Split into ${#parts[@]} parts"
+              if [[ -f "$file" ]]; then
+                rm "$file"
+              fi
+            else
+              echo "📁 $basename (${size_mb}MB) — under split threshold"
+              mv "$file" "./downloads/"
+            fi
+          }
+
+          export -f process_file
+          export THRESHOLD_MB HARD_LIMIT_MB
+
+          if [[ -d ./downloads/temp ]]; then
+            find ./downloads/temp -type f -exec bash -c 'process_file "$1"' _ {} \;
+            rm -rf ./downloads/temp
+          else
+            echo "ℹ️ No temp files to process"
+          fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📂 Final deliverables in ./downloads/:"
+          ls -lh ./downloads/ 2>/dev/null | tail -n +2 | awk '{print "  • " $NF " (" $5 ")"}'
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: 📤 Commit & Force-Push to 'downloads' Branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [[ ! -d ./downloads ]]; then
+            echo "ℹ️ No downloads directory"
             exit 0
           fi
 
-          cd ./release-assets
-          for file in *; do
-            [[ -f "$file" ]] || continue
-            size=$(stat -c%s "$file")
-            size_mb=$((size / 1048576))
-            if [[ $size -gt $((THRESHOLD_MB * 1048576)) ]]; then
-              echo "✂️ Splitting $file ($size_mb MB) into ${THRESHOLD_MB}MB parts..."
-              zip -r -s "${THRESHOLD_MB}m" "${file}.zip" "$file"
-              shopt -s nullglob
-              parts=("${file}".z* "${file}.zip")
-              if [[ ${#parts[@]} -gt 0 ]]; then
-                echo "✅ Created ${#parts[@]} parts, removing original"
-                rm "$file"
-              else
-                echo "❌ Split failed"
-                exit 1
-              fi
-            else
-              echo "📁 $file ($size_mb MB) – under threshold, kept as single file"
-            fi
-          done
-          cd ../..
+          git add ./downloads/
 
-      - name: 🚀 Create GitHub Release (with retry)
-        run: |
-          set -euo pipefail
-          TAG=$(grep '^tag=' /tmp/release_info.txt | cut -d= -f2-)
-          NAME=$(grep '^name=' /tmp/release_info.txt | cut -d= -f2-)
-          NOTES=$(grep '^notes=' /tmp/release_info.txt | cut -d= -f2-)
-          REPO="${{ github.repository }}"
-          GITHUB_SHA="${{ github.sha }}"
-
-          if [[ ! -d ./release-assets ]] || [[ -z $(ls -A ./release-assets 2>/dev/null) ]]; then
-            echo "❌ No files in release-assets/"
-            exit 1
+          if git diff --staged --quiet; then
+            echo "ℹ️ No changes to commit"
+            exit 0
           fi
 
+          TOTAL_FILES=$(git diff --staged --name-only | wc -l)
+          echo "📦 Committing $TOTAL_FILES file(s)"
+
+          git commit -m "chore: add YouTube content [skip ci]"
+
           for attempt in 1 2 3; do
-            echo "🚀 Release attempt $attempt..."
-            if gh release create "$TAG" ./release-assets/* \
-                --title "$NAME" \
-                --notes "$NOTES" \
-                --repo "$REPO" \
-                --target "$GITHUB_SHA"; then
-              echo "✅ Release published: https://github.com/$REPO/releases/tag/${TAG}"
+            echo "🚀 Force-push attempt $attempt to downloads branch..."
+            if git push origin HEAD:downloads --force; then
+              echo "✅ Force-push succeeded on attempt $attempt"
               exit 0
             fi
-            echo "⚠️ Release creation failed, retrying in 15s..."
+            echo "⚠️ Push failed, waiting 15 seconds..."
             sleep 15
           done
-          echo "❌ Release creation failed after 3 attempts"
+          echo "❌ Push failed after 3 attempts"
           exit 1
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_SHA: ${{ github.sha }}
+
+      - name: 📦 Upload Artifact (easy download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-download-${{ github.run_id }}
+          path: ./downloads/*
+          retention-days: 90
+
+      - name: 📋 Summary
+        run: |
+          echo "📁 Files committed to branch 'downloads'"
+          echo "🌐 Permanent zip: https://github.com/${{ github.repository }}/archive/refs/heads/downloads.zip"
+          echo "📦 Artifact available in this run's 'Artifacts' section (expires in 90 days)"
