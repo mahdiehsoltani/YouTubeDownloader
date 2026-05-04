@@ -21,10 +21,10 @@ on:
         type: string
         default: '720p'
       split_threshold_mb:
-        description: '📦 Split files larger than (MB) — 0 = never'
+        description: '📦 Split files larger than (MB) — 0 = never (default 1800 MB, near release limit)'
         required: false
         type: number
-        default: 90
+        default: 1800
 
 jobs:
   download-and-release:
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write          # needed to create releases
+      contents: write
 
     steps:
       - name: 🔧 Install Dependencies (with retry)
@@ -40,11 +40,11 @@ jobs:
           set -euo pipefail
           for i in 1 2 3; do
             echo "🔄 apt-get attempt $i..."
-            sudo apt-get update && sudo apt-get install -y zip curl jq ffmpeg && break || sleep 10
+            sudo apt-get update && sudo apt-get install -y zip curl jq ffmpeg gh && break || sleep 10
           done
           pip install requests
 
-      - name: 🎯 Request Conversion via API
+      - name: 🎯 Request Conversion & Generate Release Info
         id: converter
         run: |
           set -euo pipefail
@@ -122,6 +122,11 @@ jobs:
               except Exception:
                   return '720p' if output_type == 'video' else '192kbps'
 
+          # validate type
+          if OUTPUT_TYPE not in ('video', 'audio'):
+              print(f"⚠️ Unknown type '{OUTPUT_TYPE}', forcing to video")
+              OUTPUT_TYPE = 'video'
+
           QUALITY = normalize_quality(OUTPUT_TYPE, QUALITY)
 
           print(f"🎯 Target: {OUTPUT_TYPE.upper()} @ {QUALITY}")
@@ -137,7 +142,6 @@ jobs:
 
           session = requests.Session()
 
-          # preflight protected
           try:
               session.get("https://media.ytmp3.gg/", headers=HEADERS, timeout=15)
           except requests.RequestException as e:
@@ -190,14 +194,16 @@ jobs:
           print(f"✅ Registered: {title}")
           print("="*50)
 
-          # ------ adaptive polling ------
+          # ------ adaptive polling with while loop ------
           download_url = None
           last_progress = -1
           stall_count = 0
-          extended_attempts = MAX_ATTEMPTS
-          for attempt in range(1, extended_attempts + 1):
+          attempt = 0
+          max_attempts = MAX_ATTEMPTS
+          while attempt < max_attempts:
+              attempt += 1
               time.sleep(STATUS_CHECK_INTERVAL)
-              print(f"🔄 Status [{attempt}/{extended_attempts}]...", end=' ')
+              print(f"🔄 Status [{attempt}/{max_attempts}]...", end=' ')
               try:
                   status_resp = session.get(status_url, headers=HEADERS, timeout=15)
                   status_data = safe_json(status_resp)
@@ -224,14 +230,12 @@ jobs:
                   print(json.dumps(status_data, indent=2))
                   sys.exit(1)
 
-              # adaptive extension
               if progress > last_progress:
                   last_progress = progress
                   stall_count = 0
-                  # if we are near the end of the loop but still making progress, extend
-                  if attempt >= extended_attempts - 5 and extended_attempts < 300:
-                      extended_attempts += 30
-                      print(f"   ↳ Progress still climbing, extended attempts to {extended_attempts}")
+                  if attempt >= max_attempts - 5 and max_attempts < 300:
+                      max_attempts += 30
+                      print(f"   ↳ Progress still climbing, extended limit to {max_attempts}")
               else:
                   stall_count += 1
                   if stall_count >= 10:
@@ -242,36 +246,26 @@ jobs:
               print("⏰ Conversion did not complete in time")
               sys.exit(1)
 
-          # ------ generate unique identifiers ------
+          # ------ identifiers ------
           video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
           video_id = video_id_match.group(1) if video_id_match else "unknown"
           safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))[:60].strip('_') or video_id
           timestamp = time.strftime("%Y%m%d-%H%M%S")
           ext = "mp3" if OUTPUT_TYPE == 'audio' else "mp4"
-          quality_label = QUALITY
-          filename = f"{safe_title}_{video_id}_{quality_label}_{timestamp}.{ext}"
+          filename = f"{safe_title}_{video_id}_{QUALITY}_{timestamp}.{ext}"
 
-          # release tag (must be unique)
           tag = f"download-{video_id}-{timestamp}-{RUN_ID}"
           release_name = f"{title} ({QUALITY})"
+          release_notes = f"**URL:** {YT_URL}\n**Type:** {OUTPUT_TYPE}\n**Quality:** {QUALITY}\n**Downloaded:** {timestamp}"
 
-          # save metadata
           with open('/tmp/metadata.txt', 'w', encoding='utf-8') as f:
-              f.write(f"{download_url}\n")
-              f.write(f"{filename}\n")
-              f.write(f"{safe_title}\n")
-              f.write(f"{OUTPUT_TYPE}\n")
-              f.write(f"{QUALITY}\n")
-              f.write(f"{status_url}\n")           # for token refresh if needed
-
+              f.write(f"{download_url}\n{filename}\n{OUTPUT_TYPE}\n{QUALITY}\n{status_url}\n")
           with open('/tmp/release_info.txt', 'w', encoding='utf-8') as f:
-              f.write(f"tag={tag}\n")
-              f.write(f"name={release_name}\n")
+              f.write(f"tag={tag}\nname={release_name}\nnotes={release_notes}\n")
 
           print(f"📥 Download URL: {download_url[:80]}...")
           print(f"📄 Filename: {filename}")
           print(f"🏷️  Release tag: {tag}")
-          print(f"🎵 Type: {OUTPUT_TYPE} | Quality: {QUALITY}")
           PYEOF
         env:
           YT_URL: ${{ github.event.inputs.url }}
@@ -279,20 +273,30 @@ jobs:
           QUALITY: ${{ github.event.inputs.quality }}
           GITHUB_RUN_ID: ${{ github.run_id }}
 
+      - name: 💾 Disk Space Check
+        run: |
+          set -euo pipefail
+          AVAIL_KB=$(df /home/runner | awk 'NR==2 {print $4}')
+          AVAIL_MB=$((AVAIL_KB / 1024))
+          echo "📀 Available space: ${AVAIL_MB} MB"
+          if [[ $AVAIL_MB -lt 3072 ]]; then
+            echo "❌ Less than 3 GB free, aborting to avoid disk exhaustion"
+            exit 1
+          fi
+
       - name: ⬇️ Download & Validate File
         id: download
         run: |
           set -euo pipefail
           DOWNLOAD_URL=$(sed -n '1p' /tmp/metadata.txt)
           FILENAME=$(sed -n '2p' /tmp/metadata.txt)
-          OUTPUT_TYPE=$(sed -n '4p' /tmp/metadata.txt)
-          STATUS_URL=$(sed -n '6p' /tmp/metadata.txt)
+          OUTPUT_TYPE=$(sed -n '3p' /tmp/metadata.txt)
+          STATUS_URL=$(sed -n '5p' /tmp/metadata.txt)
 
-          mkdir -p ./release-assets
           TEMP_DIR="./temp-download"
           mkdir -p "$TEMP_DIR"
 
-          echo "⬇️ Downloading $OUTPUT_TYPE ..."
+          echo "⬇️ Downloading $OUTPUT_TYPE..."
           echo "📄 File: $FILENAME"
 
           EXPECTED_SIZE=$(curl -sI -L "$DOWNLOAD_URL" | grep -i content-length | awk 'END{print $2}' | tr -d '\r')
@@ -305,29 +309,23 @@ jobs:
           fi
 
           download_file() {
-            local url="$1"
-            local output="$2"
+            local url="$1" output="$2"
             curl -sS -w "%{http_code}" -L \
-              --fail \
-              --speed-limit 1024 --speed-time 30 \
+              --fail --speed-limit 1024 --speed-time 30 \
               -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0" \
               -H "Referer: https://media.ytmp3.gg/" \
-              -o "$output" \
-              --max-time "$TIMEOUT" \
-              "$url" 2>&1 | tail -1
+              -o "$output" --max-time "$TIMEOUT" "$url" 2>&1 | tail -1
           }
 
           HTTP_CODE=$(download_file "$DOWNLOAD_URL" "$TEMP_DIR/$FILENAME")
           if [[ "$HTTP_CODE" != "200" ]]; then
-            echo "⚠️ First download attempt returned HTTP $HTTP_CODE – refreshing token..."
-            # re-query status endpoint for a new downloadUrl
-            FRESH_DOWNLOAD_URL=$(curl -sS -L \
+            echo "⚠️ First download attempt HTTP $HTTP_CODE – refreshing token..."
+            FRESH_URL=$(curl -sS -L \
               -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0" \
-              -H "Accept: application/json" \
-              "$STATUS_URL" | jq -r '.downloadUrl // empty')
-            if [[ -n "$FRESH_DOWNLOAD_URL" && "$FRESH_DOWNLOAD_URL" != "null" ]]; then
+              -H "Accept: application/json" "$STATUS_URL" | jq -r '.downloadUrl // empty')
+            if [[ -n "$FRESH_URL" && "$FRESH_URL" != "null" ]]; then
               echo "🔄 Got fresh download URL, retrying..."
-              HTTP_CODE=$(download_file "$FRESH_DOWNLOAD_URL" "$TEMP_DIR/$FILENAME")
+              HTTP_CODE=$(download_file "$FRESH_URL" "$TEMP_DIR/$FILENAME")
             fi
           fi
 
@@ -338,20 +336,17 @@ jobs:
 
           FILE_SIZE=$(stat -c%s "$TEMP_DIR/$FILENAME")
           FILE_SIZE_MB=$((FILE_SIZE / 1048576))
-
           if [[ $FILE_SIZE -lt 10240 ]]; then
-            echo "❌ Downloaded file too small (${FILE_SIZE_MB} MB) – suspect error page"
+            echo "❌ File too small (${FILE_SIZE_MB} MB) – suspect error page"
             exit 1
           fi
+          echo "📏 Size: ${FILE_SIZE_MB} MB"
 
-          echo "📏 Actual size: ${FILE_SIZE_MB} MB"
-
-          # integrity check
           echo "🔍 Verifying media integrity..."
           ffprobe -v error -show_entries stream=codec_type,duration \
             -of default=noprint_wrappers=1 "$TEMP_DIR/$FILENAME" > /tmp/ffprobe.txt 2>&1 || true
           if ! grep -q "codec_type" /tmp/ffprobe.txt; then
-            echo "❌ ffprobe found no valid streams"
+            echo "❌ No valid streams found"
             cat /tmp/ffprobe.txt
             exit 1
           fi
@@ -362,19 +357,12 @@ jobs:
           fi
           echo "✅ Media integrity OK (duration: ${DURATION:-unknown}s)"
 
-          # content-type check (improved parsing)
           CONTENT_TYPE=$(curl -sI -L "$DOWNLOAD_URL" | grep -i '^Content-Type:' | awk 'END{print $2}' | tr -d '\r;')
           if [[ -n "$CONTENT_TYPE" ]]; then
-            if [[ $OUTPUT_TYPE == 'video' && "$CONTENT_TYPE" != *video* ]]; then
-              echo "⚠️ Content-Type may be unusual: $CONTENT_TYPE (expected video/*)"
-            elif [[ $OUTPUT_TYPE == 'audio' && "$CONTENT_TYPE" != *audio* && "$CONTENT_TYPE" != *mpeg* ]]; then
-              echo "⚠️ Content-Type may be unusual: $CONTENT_TYPE (expected audio/*)"
-            else
-              echo "📋 Content-Type: $CONTENT_TYPE"
-            fi
+            echo "📋 Content-Type: $CONTENT_TYPE"
           fi
 
-          # move to release staging (no split yet)
+          mkdir -p ./release-assets
           mv "$TEMP_DIR/$FILENAME" "./release-assets/"
           echo "✅ File staged for release: $FILENAME"
 
@@ -402,7 +390,6 @@ jobs:
             if [[ $size -gt $((THRESHOLD_MB * 1048576)) ]]; then
               echo "✂️ Splitting $file ($size_mb MB) into ${THRESHOLD_MB}MB parts..."
               zip -r -s "${THRESHOLD_MB}m" "${file}.zip" "$file"
-              # verify parts
               shopt -s nullglob
               parts=("${file}".z* "${file}.zip")
               if [[ ${#parts[@]} -gt 0 ]]; then
@@ -418,16 +405,32 @@ jobs:
           done
           cd ../..
 
-      - name: 🚀 Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: $(cat /tmp/release_info.txt | grep '^tag=' | cut -d= -f2)
-          name: $(cat /tmp/release_info.txt | grep '^name=' | cut -d= -f2-)
-          files: ./release-assets/*
-          fail_on_unmatched_files: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 📋 Summary
+      - name: 🚀 Create GitHub Release (with retry)
         run: |
-          TAG=$(cat /tmp/release_info.txt | grep '^tag=' | cut -d= -f2)
-          echo "🎉 Release published: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+          set -euo pipefail
+          TAG=$(grep '^tag=' /tmp/release_info.txt | cut -d= -f2-)
+          NAME=$(grep '^name=' /tmp/release_info.txt | cut -d= -f2-)
+          NOTES=$(grep '^notes=' /tmp/release_info.txt | cut -d= -f2-)
+
+          if [[ ! -d ./release-assets ]] || [[ -z $(ls -A ./release-assets 2>/dev/null) ]]; then
+            echo "❌ No files in release-assets/"
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            echo "🚀 Release attempt $attempt..."
+            if gh release create "$TAG" ./release-assets/* \
+                --title "$NAME" \
+                --notes "$NOTES" \
+                --target "${GITHUB_SHA:-main}"; then
+              echo "✅ Release published: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+              exit 0
+            fi
+            echo "⚠️ Release creation failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "❌ Release creation failed after 3 attempts"
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
