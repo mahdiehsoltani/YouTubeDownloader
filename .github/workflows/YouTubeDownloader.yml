@@ -411,6 +411,8 @@ jobs:
           TAG=$(grep '^tag=' /tmp/release_info.txt | cut -d= -f2-)
           NAME=$(grep '^name=' /tmp/release_info.txt | cut -d= -f2-)
           NOTES=$(grep '^notes=' /tmp/release_info.txt | cut -d= -f2-)
+          REPO="${{ github.repository }}"
+          GITHUB_SHA="${{ github.sha }}"
 
           if [[ ! -d ./release-assets ]] || [[ -z $(ls -A ./release-assets 2>/dev/null) ]]; then
             echo "❌ No files in release-assets/"
@@ -422,8 +424,9 @@ jobs:
             if gh release create "$TAG" ./release-assets/* \
                 --title "$NAME" \
                 --notes "$NOTES" \
-                --target "${GITHUB_SHA:-main}"; then
-              echo "✅ Release published: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+                --repo "$REPO" \
+                --target "$GITHUB_SHA"; then
+              echo "✅ Release published: https://github.com/$REPO/releases/tag/${TAG}"
               exit 0
             fi
             echo "⚠️ Release creation failed, retrying in 15s..."
