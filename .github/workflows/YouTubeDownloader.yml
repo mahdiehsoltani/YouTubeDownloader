@@ -361,7 +361,7 @@ jobs:
           ls -lh ./downloads/ 2>/dev/null | tail -n +2 | awk '{print "  • " $NF " (" $5 ")"}'
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: 📤 Commit and Push to Repository
+      - name: 📤 Commit and Push to Repository (with retry)
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           
@@ -376,33 +376,22 @@ jobs:
             exit 0
           fi
           
-          # Get list of staged files
-          mapfile -t STAGED_FILES < <(git diff --staged --name-only)
-          TOTAL_FILES=${#STAGED_FILES[@]}
-          
+          TOTAL_FILES=$(git diff --staged --name-only | wc -l)
           echo "📦 Found $TOTAL_FILES file(s) to upload"
           
-          # Unstage everything first for batch processing
-          git reset HEAD ./downloads/
+          # Commit everything at once (no batching needed with retry)
+          git commit -m "chore: add YouTube content [skip ci]"
           
-          BATCH_SIZE=5
-          for (( i=0; i<TOTAL_FILES; i+=BATCH_SIZE )); do
-            BATCH_NUM=$((i / BATCH_SIZE + 1))
-            END=$((i + BATCH_SIZE))
-            [[ $END -gt $TOTAL_FILES ]] && END=$TOTAL_FILES
-            
-            echo "🚀 Uploading batch $BATCH_NUM [$((i+1))–${END} of $TOTAL_FILES]"
-            
-            # Add files in current batch
-            for (( j=i; j<END; j++ )); do
-              git add "${STAGED_FILES[$j]}"
-            done
-            
-            git commit -m "chore: add YouTube content batch $BATCH_NUM [skip ci]"
-            git pull --rebase origin "$BRANCH" || true
-            git push origin "HEAD:$BRANCH"
-            
-            echo "✅ Batch $BATCH_NUM uploaded"
+          # Retry the push up to 3 times to survive transient GitHub errors
+          for attempt in 1 2 3; do
+            echo "🚀 Push attempt $attempt..."
+            if git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH"; then
+              echo "✅ Push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "⚠️ Push failed, waiting 15 seconds before retry..."
+            sleep 15
           done
           
-          echo "🎉 All files successfully uploaded to $BRANCH"
+          echo "❌ Push failed after 3 attempts"
+          exit 1
