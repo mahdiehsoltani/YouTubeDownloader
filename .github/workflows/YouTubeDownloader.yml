@@ -43,6 +43,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y zip curl jq
+          pip install requests
 
       - name: 🎯 Request Conversion via API
         id: converter
@@ -68,39 +69,32 @@ jobs:
               """Normalize and validate input quality"""
               
               if output_type == 'audio':
-                  # Remove extra characters and normalize
                   quality = quality_input.lower().strip()
-                  # If it has 'p' (entered by mistake), remove it
                   quality = quality.replace('p', '')
-                  # If it doesn't have 'kbps', add it
                   if 'kbps' not in quality:
                       if quality.endswith('k'):
                           quality = quality.replace('k', 'kbps')
                       else:
-                          # If it's just a number
                           quality = quality + 'kbps'
                   
-                  # Check if valid
                   if quality in AUDIO_BITRATES:
                       return quality
                   
-                  # Find the closest quality
                   print(f"⚠️ Invalid audio quality: '{quality_input}'")
-                  bitrate_num = int(''.join(filter(str.isdigit, quality)))
-                  
-                  # Find closest bitrate
-                  supported_nums = [int(''.join(filter(str.isdigit, b))) for b in AUDIO_BITRATES]
-                  closest = min(supported_nums, key=lambda x: abs(x - bitrate_num))
-                  fallback = [b for b in AUDIO_BITRATES if str(closest) in b][0]
-                  
-                  print(f"🔄 Using closest supported bitrate: {fallback}")
-                  return fallback
+                  try:
+                      bitrate_num = int(''.join(filter(str.isdigit, quality)))
+                      supported_nums = [int(''.join(filter(str.isdigit, b))) for b in AUDIO_BITRATES]
+                      closest = min(supported_nums, key=lambda x: abs(x - bitrate_num))
+                      fallback = [b for b in AUDIO_BITRATES if str(closest) in b][0]
+                      print(f"🔄 Using closest supported bitrate: {fallback}")
+                      return fallback
+                  except (ValueError, IndexError):
+                      print("🔄 Invalid input; falling back to 192kbps")
+                      return '192kbps'
               
               else:  # video
                   quality = quality_input.lower().strip()
-                  # If it has 'k' (entered by mistake for video), remove it
                   quality = quality.replace('k', '')
-                  # If it doesn't have 'p', add it
                   if not quality.endswith('p'):
                       quality += 'p'
                   
@@ -109,21 +103,23 @@ jobs:
                   
                   print(f"⚠️ Invalid video quality: '{quality_input}'")
                   
-                  # Map invalid qualities to valid ones
                   quality_map = {
-                      '240p': '360p',   # 240p is not supported, closest is 360p
-                      '4k': '1080p',    # 4K is not supported, closest is 1080p
+                      '240p': '360p',
+                      '4k': '1080p',
                       '2160p': '1080p',
                       '1440p': '1080p',
                       '2k': '1080p',
                   }
                   
-                  if quality in quality_map:
-                      fallback = quality_map[quality]
-                      print(f"🔄 Mapped to closest quality: {fallback}")
-                      return fallback
+                  try:
+                      if quality in quality_map:
+                          fallback = quality_map[quality]
+                          print(f"🔄 Mapped to closest quality: {fallback}")
+                          return fallback
+                      # else fall through to default
+                  except Exception:
+                      pass  # shouldn't happen, but just in case
                   
-                  # If none matched, default to 720p
                   print("🔄 Using default: 720p")
                   return '720p'
           
@@ -177,7 +173,6 @@ jobs:
               if response.status_code != 200:
                   print(f"❌ API Error ({response.status_code}): {response.text[:200]}")
                   
-                  # If it's 400, try once with different quality
                   if response.status_code == 400 and OUTPUT_TYPE == 'audio':
                       print("🔄 Retrying with fallback quality: 192kbps")
                       payload["audio"]["bitrate"] = "192kbps"
@@ -240,27 +235,22 @@ jobs:
               sys.exit(1)
           
           # ========== GENERATE SAFE FILENAME ==========
-          # Extract video ID from URL
           video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
           video_id = video_id_match.group(1) if video_id_match else "unknown"
           
-          # Clean up the title
           safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
-          # Limit filename length
           safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
           safe_title = safe_title.strip('_') or video_id
           
-          # Determine extension and quality label
           if OUTPUT_TYPE == 'audio':
               extension = "mp3"
-              quality_label = QUALITY  # e.g. 320kbps
+              quality_label = QUALITY
           else:
               extension = "mp4"
-              quality_label = QUALITY  # e.g. 720p
+              quality_label = QUALITY
           
           filename = f"{safe_title}_{video_id}_{quality_label}.{extension}"
           
-          # ========== SAVE METADATA ==========
           with open('/tmp/metadata.txt', 'w', encoding='utf-8') as f:
               f.write(f"{download_url}\n")
               f.write(f"{filename}\n")
@@ -309,6 +299,11 @@ jobs:
           FILE_SIZE=$(stat -c%s "./downloads/temp/$FILENAME")
           FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           
+          if [ "$FILE_SIZE" -eq 0 ]; then
+            echo "❌ Downloaded file is empty!"
+            exit 1
+          fi
+          
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "✅ Downloaded: $FILENAME"
           echo "📏 Size: ${FILE_SIZE_MB} MB"
@@ -318,6 +313,13 @@ jobs:
       - name: ✂️ Smart Split Large Files
         run: |
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
+          
+          # Basic validation – ensure it's a non-negative integer
+          if ! [[ "$THRESHOLD_MB" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid split threshold: $THRESHOLD_MB (must be a positive integer or 0)"
+            exit 1
+          fi
+          
           THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
           
           process_file() {
@@ -338,7 +340,6 @@ jobs:
               PARTS_COUNT=$(ls ./downloads/${basename}.z* 2>/dev/null | wc -l)
               echo "✅ Created $PARTS_COUNT parts"
               
-              # Remove original file from temp
               rm "$file"
             else
               if [[ $THRESHOLD_BYTES -eq 0 ]]; then
@@ -368,7 +369,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Stage all downloaded files
           git add ./downloads/
           
           if git diff --staged --quiet; then
@@ -379,10 +379,8 @@ jobs:
           TOTAL_FILES=$(git diff --staged --name-only | wc -l)
           echo "📦 Found $TOTAL_FILES file(s) to upload"
           
-          # Commit everything at once (no batching needed with retry)
           git commit -m "chore: add YouTube content [skip ci]"
           
-          # Retry the push up to 3 times to survive transient GitHub errors
           for attempt in 1 2 3; do
             echo "🚀 Push attempt $attempt..."
             if git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH"; then
