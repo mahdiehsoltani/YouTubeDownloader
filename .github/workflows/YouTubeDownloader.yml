@@ -116,9 +116,8 @@ jobs:
                           fallback = quality_map[quality]
                           print(f"🔄 Mapped to closest quality: {fallback}")
                           return fallback
-                      # else fall through to default
                   except Exception:
-                      pass  # shouldn't happen, but just in case
+                      pass
                   
                   print("🔄 Using default: 720p")
                   return '720p'
@@ -205,9 +204,9 @@ jobs:
           
           # ========== POLL FOR COMPLETION ==========
           download_url = None
-          for attempt in range(MAX_ATTEMPTS):
+          for attempt in range(1, MAX_ATTEMPTS + 1):
               time.sleep(STATUS_CHECK_INTERVAL)
-              print(f"🔄 Checking status [{attempt + 1}/{MAX_ATTEMPTS}]...")
+              print(f"🔄 Checking status [{attempt}/{MAX_ATTEMPTS}]...")
               
               try:
                   status_resp = session.get(status_url, headers=HEADERS, timeout=15)
@@ -228,6 +227,15 @@ jobs:
               elif status == 'failed':
                   print("❌ Conversion failed!")
                   print(f"   Error details: {status_data.get('error', 'Unknown error')}")
+                  sys.exit(1)
+              elif status == 'error':
+                  print("❌ Conversion returned error status!")
+                  print(f"   Full response: {json.dumps(status_data, indent=2)}")
+                  sys.exit(1)
+              elif status not in ('pending', 'processing'):
+                  # Catch any other unexpected status
+                  print(f"❌ Unexpected conversion status: '{status}'")
+                  print(f"   Full response: {json.dumps(status_data, indent=2)}")
                   sys.exit(1)
           
           if not download_url:
@@ -314,7 +322,6 @@ jobs:
         run: |
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
           
-          # Basic validation – ensure it's a non-negative integer
           if ! [[ "$THRESHOLD_MB" =~ ^[0-9]+$ ]]; then
             echo "❌ Invalid split threshold: $THRESHOLD_MB (must be a positive integer or 0)"
             exit 1
